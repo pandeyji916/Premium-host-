@@ -429,8 +429,10 @@ def _ai_scan_code(code: str, filename: str = "file.py") -> Optional[Dict[str, An
     if not base_url:
         return None
 
-    # Limit code sent to AI — first 6000 chars covers most bots
-    code_snippet = code[:6000]
+    # Never send raw credentials to an external AI provider. Redact both
+    # known vault values and credential-looking assignments first.
+    safe_code = _redact_sensitive_text(code)
+    code_snippet = safe_code[:6000]
     payload = _json.dumps({
         "model": "google/gemma-4-31b-it:free",
         "max_tokens": 512,
@@ -1701,6 +1703,45 @@ def _is_html_mode(pm) -> bool:
     except Exception:
         return False
 
+def _redact_sensitive_text(text: Any) -> Any:
+    """Redact known credentials before text leaves the host process.
+
+    This is defense-in-depth: normal UI code should already avoid sending
+    secret values, but this guard prevents accidental leaks through owner
+    notifications, errors, AI scan prompts, or future UI changes.
+    """
+    if text is None:
+        return text
+    s = str(text)
+    if not s:
+        return s
+
+    # Exact values currently held by the host and child-bot ENV vault.
+    secrets = set()
+    for v in (_HOST_SECRET_ENV or {}).values():
+        if isinstance(v, str) and len(v) >= 6:
+            secrets.add(v)
+    try:
+        for b in db_load_ro().get("bots", {}).values():
+            for v in (b.get("env") or {}).values():
+                if isinstance(v, str) and len(v) >= 6:
+                    secrets.add(v)
+    except Exception:
+        pass
+    for secret in sorted(secrets, key=len, reverse=True):
+        if secret:
+            s = s.replace(secret, "[REDACTED]")
+
+    # Also redact credential-looking assignments even if they are not in the
+    # current vault (e.g. a hard-coded credential inside uploaded source).
+    s = re.sub(
+        r"(?is)(\b(?:BOT_TOKEN|TELEGRAM_BOT_TOKEN|MAIN_BOT_TOKEN|API_KEY|API_HASH|[A-Z][A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PRIVATE_KEY))\s*[=:]\s*)([^\s<\n,;]+)",
+        r"\1[REDACTED]", s,
+    )
+    s = re.sub(r"(?i)(\bBearer\s+)[A-Za-z0-9._~+/=-]+", r"\1[REDACTED]", s)
+    return s
+
+
 def _wrap_quote_bold(text):
     if text is None:
         return text
@@ -1722,37 +1763,48 @@ def _patch_bot_styling(b):
     orig_send_anim    = getattr(b, "send_animation", None)
 
     def send_message(chat_id, text, *args, **kwargs):
+        text = _redact_sensitive_text(text)
         if _is_html_mode(kwargs.get("parse_mode")):
             text = _wrap_quote_bold(text)
         return orig_send(chat_id, text, *args, **kwargs)
 
     def reply_to(message, text, *args, **kwargs):
+        text = _redact_sensitive_text(text)
         if _is_html_mode(kwargs.get("parse_mode")):
             text = _wrap_quote_bold(text)
         return orig_reply(message, text, *args, **kwargs)
 
     def edit_message_text(text, *args, **kwargs):
+        text = _redact_sensitive_text(text)
         if _is_html_mode(kwargs.get("parse_mode")):
             text = _wrap_quote_bold(text)
         return orig_edit_text(text, *args, **kwargs)
 
     def edit_message_caption(*args, **kwargs):
+        if "caption" in kwargs:
+            kwargs["caption"] = _redact_sensitive_text(kwargs.get("caption"))
         if _is_html_mode(kwargs.get("parse_mode")):
             if "caption" in kwargs:
                 kwargs["caption"] = _wrap_quote_bold(kwargs.get("caption"))
         return orig_edit_caption(*args, **kwargs)
 
     def send_photo(chat_id, photo, *args, **kwargs):
+        if kwargs.get("caption"):
+            kwargs["caption"] = _redact_sensitive_text(kwargs["caption"])
         if _is_html_mode(kwargs.get("parse_mode")) and kwargs.get("caption"):
             kwargs["caption"] = _wrap_quote_bold(kwargs["caption"])
         return orig_send_photo(chat_id, photo, *args, **kwargs)
 
     def send_video(chat_id, video, *args, **kwargs):
+        if kwargs.get("caption"):
+            kwargs["caption"] = _redact_sensitive_text(kwargs["caption"])
         if _is_html_mode(kwargs.get("parse_mode")) and kwargs.get("caption"):
             kwargs["caption"] = _wrap_quote_bold(kwargs["caption"])
         return orig_send_video(chat_id, video, *args, **kwargs)
 
     def send_document(chat_id, document, *args, **kwargs):
+        if kwargs.get("caption"):
+            kwargs["caption"] = _redact_sensitive_text(kwargs["caption"])
         if _is_html_mode(kwargs.get("parse_mode")) and kwargs.get("caption"):
             kwargs["caption"] = _wrap_quote_bold(kwargs["caption"])
         return orig_send_doc(chat_id, document, *args, **kwargs)
@@ -1766,6 +1818,8 @@ def _patch_bot_styling(b):
     b.send_document        = send_document
     if orig_send_anim is not None:
         def send_animation(chat_id, animation, *args, **kwargs):
+            if kwargs.get("caption"):
+                kwargs["caption"] = _redact_sensitive_text(kwargs["caption"])
             if _is_html_mode(kwargs.get("parse_mode")) and kwargs.get("caption"):
                 kwargs["caption"] = _wrap_quote_bold(kwargs["caption"])
             return orig_send_anim(chat_id, animation, *args, **kwargs)
@@ -2402,14 +2456,14 @@ _COMMON_ENV_KEYS = {
 }
 
 def _looks_like_env_key(name: str) -> bool:
+    """Return True for any syntactically valid dotenv variable name.
+
+    Do not maintain a suffix allow-list here: real projects frequently use
+    arbitrary names such as FIREBASE_CONFIG, TELEGRAM_SESSION, DEBUG_MODE,
+    S3_BUCKET, etc.  The old allow-list silently dropped those variables.
+    """
     n = str(name or "").strip().upper()
-    return bool(re.match(r"^[A-Z_][A-Z0-9_]*$", n)) and (
-        n in _COMMON_ENV_KEYS or n.endswith((
-            "_KEY", "_TOKEN", "_ID", "_IDS", "_URI", "_URL", "_HASH",
-            "_CHANNEL", "_CHANNEL_ID", "_USERNAME", "_USER", "_NAME", "_SECRET",
-            "_PASSWORD", "_HOST", "_PORT", "_DATABASE"
-        ))
-    )
+    return bool(re.match(r"^[A-Z_][A-Z0-9_]*$", n))
 
 
 def _clean_env_value(key: str, value: Any) -> str:
@@ -2430,46 +2484,109 @@ def _clean_env_value(key: str, value: Any) -> str:
     return v
 
 
+def _parse_dotenv_text(raw: Any) -> Dict[str, str]:
+    """Parse a complete pasted .env block without collapsing variables.
+
+    Supports KEY=value, optional export, comments, quoted values and quoted
+    values containing spaces/newlines.  It deliberately never treats the
+    first assignment as a synthetic ``__PASTED_ENV__`` variable.
+    """
+    text = "" if raw is None else str(raw)
+    out: Dict[str, str] = {}
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    current_key: Optional[str] = None
+    current_value: List[str] = []
+    quote: Optional[str] = None
+
+    def flush() -> None:
+        nonlocal current_key, current_value, quote
+        if current_key is not None:
+            val = "\n".join(current_value)
+            out[current_key] = _clean_env_value(current_key, val)
+        current_key = None
+        current_value = []
+        quote = None
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if current_key is None:
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[7:].lstrip()
+            m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$", line)
+            if not m:
+                continue
+            current_key = m.group(1).upper()
+            val = m.group(2).strip()
+            if val[:1] in {"'", '"'}:
+                quote = val[0]
+                rest = val[1:]
+                if rest.endswith(quote) and not rest.endswith("\\" + quote):
+                    current_value = [rest[:-1]]
+                    flush()
+                else:
+                    current_value = [rest]
+            else:
+                # Strip an inline comment only when it is separated by space.
+                val = re.sub(r"\s+#.*$", "", val).strip()
+                current_value = [val]
+                flush()
+        else:
+            # Continue a quoted multiline value until its closing quote.
+            current_value.append(raw_line)
+            joined = "\n".join(current_value)
+            if joined.endswith(quote or "") and not joined.endswith("\\" + (quote or "")):
+                current_value[-1] = current_value[-1][:-1]
+                flush()
+    flush()
+    return out
+
+
 def _split_embedded_env_value(key: str, value: Any) -> Dict[str, str]:
-    """Turn a accidentally pasted .env block stored inside one value into KV pairs."""
+    """Parse one KEY=value input, including an accidentally pasted .env block."""
     k0 = str(key).strip().upper()
     raw = "" if value is None else str(value).strip()
-    if not raw:
-        return {k0: ""}
-    # Locate embedded KEY= markers.  This deliberately accepts a marker
-    # immediately after a quote, e.g. TOKEN"GROQ_API_KEY="..."OWNER_ID="...".
+    if "\n" in raw or "\r" in raw:
+        parsed = _parse_dotenv_text(raw)
+        return parsed or {k0: _clean_env_value(k0, raw)}
+
+    # Handle legacy corrupted values containing multiple KEY=value assignments.
     pat = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*)\s*=\s*")
     matches = [m for m in pat.finditer(raw) if _looks_like_env_key(m.group(1))]
-    embedded = [m for m in matches if m.start() > 0]
-    if not embedded:
+    if not matches or matches[0].start() != 0:
         return {k0: _clean_env_value(k0, raw)}
 
+    # If there is exactly one assignment and it is the supplied key, keep it.
+    if len(matches) == 1 and matches[0].group(1).upper() == k0:
+        return {k0: _clean_env_value(k0, raw[matches[0].end():])}
+
     out: Dict[str, str] = {}
-    first = embedded[0]
-    prefix = raw[:first.start()].strip().strip('"\'')
-    if prefix:
-        out[k0] = _clean_env_value(k0, prefix)
-    for i, m in enumerate(embedded):
+    for i, m in enumerate(matches):
         name = m.group(1).strip().upper()
-        end = embedded[i + 1].start() if i + 1 < len(embedded) else len(raw)
-        part = raw[m.end():end].strip()
-        # Strip quote characters that were only delimiters between assignments.
-        part = part.strip().strip('"\'').strip()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(raw)
+        part = raw[m.end():end].strip().strip('"\'').strip()
         out[name] = _clean_env_value(name, part)
     return out
 
 
 def _repair_env_dict(env: Dict[str, Any]) -> Dict[str, str]:
-    """Normalize env and recover variables concatenated into another value."""
+    """Normalize ENV dictionaries and recover legacy pasted/corrupted blocks."""
     repaired: Dict[str, str] = {}
     for key, value in (env or {}).items():
         k = str(key).strip().upper()
-        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", k):
+        if not _looks_like_env_key(k):
             continue
-        parts = _split_embedded_env_value(k, value)
-        repaired.update(parts)
+        # Synthetic legacy key: parse the whole value as dotenv text.
+        if k == "__PASTED_ENV__":
+            parsed = _parse_dotenv_text(value)
+            if parsed:
+                repaired.update(parsed)
+            else:
+                repaired.update(_split_embedded_env_value(k, value))
+            continue
+        repaired.update(_split_embedded_env_value(k, value))
     return repaired
-
 
 def safe_env(bot_dir: Path, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     # Never inherit the HOST's private secrets, but DO pass the CHILD bot's
@@ -3548,10 +3665,11 @@ def _make_tarball() -> Path:
         storage_dir = BASE_DIR / "storage"
         if storage_dir.exists():
             tf.add(str(storage_dir), arcname="storage", filter=_filter)
-        # Backup sandbox/ — bot env vars, cron config (not .deps to save space)
-        sandbox_dir = BASE_DIR / "sandbox"
-        if sandbox_dir.exists():
-            tf.add(str(sandbox_dir), arcname="sandbox", filter=_filter)
+        # NEVER back up sandbox/. It contains decrypted child source and any
+        # project-local .env files while a bot is running. The durable backup
+        # already contains encrypted uploads under storage/encfiles and the
+        # DB metadata; restoring sandbox would create a secret-exfiltration
+        # path to GitHub. Runtime directories are recreated on demand.
     return tmp
 
 
@@ -3968,6 +4086,29 @@ def notify_owner(html: str) -> None:
         bot.send_message(OWNER_ID, html, parse_mode="HTML")
     except Exception as e:
         print(f"[notify_owner] {e}")
+
+
+def _message_contains_secret(message: Optional[types.Message]) -> bool:
+    """Return True if a Telegram message appears to contain credentials/ENV."""
+    if message is None:
+        return False
+    text = "\n".join(filter(None, [getattr(message, "text", None), getattr(message, "caption", None)]))
+    if re.search(r"(?im)^\s*(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=", text):
+        return True
+    if _SEC_TOKEN_RE.search(text):
+        return True
+    return bool(re.search(r"(?i)\b(?:api[_-]?hash|session(?:_string)?|password|secret|private[_-]?key|api[_-]?key)\s*[=:]", text))
+
+
+def _safe_forward_message(chat_id: Any, from_chat_id: Any, message: Optional[types.Message]) -> bool:
+    """Forward only messages that do not look like ENV/credential payloads."""
+    if _message_contains_secret(message):
+        return False
+    try:
+        bot.forward_message(chat_id, from_chat_id, message.message_id)
+        return True
+    except Exception:
+        return False
 
 
 def _normalize_chat_ref(value: Any) -> Any:
@@ -8139,10 +8280,13 @@ def is_bot_blocked_by_approval(b: Dict[str, Any]) -> bool:
 
 
 def _send_approval_request_to_admins(b: Dict[str, Any], info: Dict[str, Any],
-                                     forwarded_msg: Optional[types.Message]) -> None:
-    """Notify every admin (owner + extra admins) about a new upload
-    waiting for review. Each admin gets the forwarded file + Approve/
-    Reject buttons."""
+                                     forwarded_msg: Optional[types.Message] = None) -> None:
+    """Notify admins about a pending upload using metadata only.
+
+    IMPORTANT: the original Telegram upload message/file is deliberately
+    never forwarded or copied to any admin/channel. `forwarded_msg` is kept
+    only for backwards-compatible callers and is intentionally ignored.
+    """
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(
         Btn(f"{G['ok']}  {sc('Approve')}",
@@ -12167,23 +12311,44 @@ def action_bot_info(call: types.CallbackQuery, bot_id: str) -> None:
     render_bot_view(call, bot_id)
 
 
-def render_env_menu(call: types.CallbackQuery, bot_id: str) -> None:
+def render_env_menu(call: types.CallbackQuery, bot_id: str, page: int = 0) -> None:
     b = find_bot(bot_id)
     if not b or (b["owner"] != call.from_user.id and not is_admin(call.from_user.id)):
         ack(call, "Not found"); return
-    env = b.get("env", {})
+
+    # Keep the UI within Telegram's message/button limits while allowing an
+    # unlimited number of stored variables. Values are NEVER displayed.
+    env = _repair_env_dict(b.get("env") or {})
+    if env != (b.get("env") or {}):
+        b["env"] = env
+        save_bot(b)
+    keys = sorted(env.keys(), key=str.upper)
+    per_page = 12
+    pages = max(1, (len(keys) + per_page - 1) // per_page)
+    page = max(0, min(int(page or 0), pages - 1))
+    visible = keys[page * per_page:(page + 1) * per_page]
+
     rows = "\n".join(
-        f"{G['bullet']} <code>{esc(k)}</code> = <code>{'*' * min(len(str(v)), 6)}\u2026</code>"
-        for k, v in list(env.items())[:20]
+        f"{G['bullet']} <code>{esc(k)}</code> = <code>{'*' * min(len(str(env.get(k, ''))), 6)}…</code>"
+        for k in visible
     ) or f"<i>{sc('No env vars set')}</i>"
     cap = (
         f"<b>{G['key']} {sc('Env Vars')}: {esc(b['name'])}</b>\n"
-        f"{G['div_eq']}\n{rows}\n{G['div']}{FOOTER}"
+        f"{G['div_eq']}\n{rows}\n{G['div']}\n"
+        f"{sc('Variables')}: {len(keys)}  •  {sc('Page')}: {page + 1}/{pages}\n"
+        f"{sc('Values are hidden and are never forwarded to admins/channels.')}{FOOTER}"
     )
-    kb = types.InlineKeyboardMarkup()
+    kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(Btn(f"{G['plus']}  {sc('Add / Edit Var')}", callback_data=f"env_add_{bot_id}"))
-    for k in list(env.keys())[:10]:
-        kb.add(Btn(f"\U0001f5d1\ufe0f {k}", callback_data=f"env_del_{bot_id}_{k}"))
+    for k in visible:
+        kb.add(Btn(f"🗑️ {k[:35]}", callback_data=f"env_del_{bot_id}_{k}"))
+    nav = []
+    if page > 0:
+        nav.append(Btn("◀️", callback_data=f"env_page_{bot_id}_{page - 1}"))
+    if page + 1 < pages:
+        nav.append(Btn("▶️", callback_data=f"env_page_{bot_id}_{page + 1}"))
+    if nav:
+        kb.row(*nav)
     kb.add(Btn(f"{G['back']}  {sc('Bot')}", callback_data=f"bot_view_{bot_id}"))
     show_text(call.message.chat.id, cap, kb, call=call)
 
@@ -14066,7 +14231,7 @@ def _handle_payment_proof(m: types.Message, st: Dict[str, Any]) -> None:
             return
 
     try:
-        bot.forward_message(OWNER_ID, m.chat.id, m.message_id)
+        _safe_forward_message(OWNER_ID, m.chat.id, m)
     except Exception:
         pass
 
@@ -14091,7 +14256,7 @@ def _handle_payment_proof(m: types.Message, st: Dict[str, Any]) -> None:
     pg = get_setting("private_approval_group", None)
     if pg:
         try:
-            bot.forward_message(pg, m.chat.id, m.message_id)
+            _safe_forward_message(pg, m.chat.id, m)
             bot.send_message(pg, f"<b>Payment Proof #{pid}</b>",
                              parse_mode="HTML", reply_markup=kb)
         except Exception:
@@ -14118,7 +14283,7 @@ def _handle_topup_proof(m: types.Message) -> None:
     })
     db_save(d)
     USER_STATES.pop(m.from_user.id, None)
-    try: bot.forward_message(OWNER_ID, m.chat.id, m.message_id)
+    try: _safe_forward_message(OWNER_ID, m.chat.id, m)
     except Exception: pass
     kb = types.InlineKeyboardMarkup()
     kb.add(
@@ -14303,7 +14468,14 @@ def _route_callback(call: types.CallbackQuery, data: str) -> None:
     if data.startswith("bot_restart_"):     ack(call); action_bot_restart(call, data.split("_", 2)[2]); return
     if data.startswith("bot_logs_"):        ack(call); action_bot_logs(call, data.split("_", 2)[2]); return
     if data.startswith("bot_info_"):        ack(call); action_bot_info(call, data.split("_", 2)[2]); return
-    if data.startswith("bot_env_"):         ack(call); render_env_menu(call, data.split("_", 2)[2]); return
+    if data.startswith("bot_env_"):         ack(call); render_env_menu(call, data.split("_", 2)[2], 0); return
+    if data.startswith("env_page_"):
+        parts = data.split("_")
+        if len(parts) >= 4:
+            try:
+                ack(call); render_env_menu(call, parts[2], int(parts[3])); return
+            except (TypeError, ValueError):
+                pass
     if data.startswith("env_add_"):         ack(call); start_env_add(call, data.split("_", 2)[2]); return
     if data.startswith("env_del_"):
         parts = data.split("_", 3)
