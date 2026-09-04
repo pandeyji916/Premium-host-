@@ -12484,8 +12484,12 @@ def render_env_menu(call: types.CallbackQuery, bot_id: str, page: int = 0) -> No
     )
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(Btn(f"{G['plus']}  {sc('Add / Edit Var')}", callback_data=f"env_add_{bot_id}"))
-    for k in visible:
-        kb.add(Btn(f"🗑️ {k[:35]}", callback_data=f"env_del_{bot_id}_{k}"))
+    # Use page/index in callback data instead of embedding the ENV key.
+    # This keeps Telegram's 64-byte callback_data limit from breaking deletion
+    # for long-but-valid variable names. The actual key is resolved from the
+    # freshly loaded ENV dictionary when the button is pressed.
+    for idx, k in enumerate(visible):
+        kb.add(Btn(f"🗑️ {k[:35]}", callback_data=f"env_del_{bot_id}_{page}_{idx}"))
     nav = []
     if page > 0:
         nav.append(Btn("◀️", callback_data=f"env_page_{bot_id}_{page - 1}"))
@@ -12509,12 +12513,50 @@ def start_env_add(call: types.CallbackQuery, bot_id: str) -> None:
     ack(call)
 
 
-def action_env_delete(call: types.CallbackQuery, bot_id: str, key: str) -> None:
+def _persist_bot_env(bot_id: str, env: Dict[str, Any]) -> bool:
+    """Persist child ENV through the mutable DB path and verify the write.
+
+    This deliberately does not rely on a read-only cached bot object.  ENV
+    values are encrypted by db_save(), while env_keys is kept in sync for
+    diagnostics/backup.  The post-write verification catches stale-cache or
+    serialization regressions instead of reporting a false "saved" result.
+    """
+    clean = _repair_env_dict(env or {})
+    with _db_lock:
+        d = db_load()
+        b = d.get("bots", {}).get(bot_id)
+        if not b:
+            return False
+        b["env"] = clean
+        b["env_keys"] = sorted(clean.keys(), key=str.upper)
+        db_save(d)
+    # Force a fresh read after the atomic write and compare keys only; values
+    # remain secret and are never logged or sent anywhere.
+    fresh = find_bot(bot_id)
+    return bool(fresh is not None and set((fresh.get("env") or {}).keys()) == set(clean.keys()))
+
+
+def action_env_delete(call: types.CallbackQuery, bot_id: str, key_or_page: str, idx: Optional[str] = None) -> None:
     b = find_bot(bot_id)
     if not b or (b["owner"] != call.from_user.id and not is_admin(call.from_user.id)):
         ack(call, "Not yours"); return
-    b.setdefault("env", {}).pop(key, None)
-    save_bot(b)
+    env = _repair_env_dict(b.get("env") or {})
+    key = key_or_page
+    # New callback form: env_del_<bot_id>_<page>_<index>. Keep legacy direct-key
+    # callbacks working for old messages.
+    if idx is not None:
+        try:
+            page = max(0, int(key_or_page))
+            pos = int(idx)
+            keys = sorted(env.keys(), key=str.upper)
+            key = keys[page * 12 + pos]
+        except (ValueError, IndexError):
+            ack(call, "Variable not found"); return
+    if key not in env:
+        ack(call, "Variable not found"); return
+    env.pop(key, None)
+    if not _persist_bot_env(bot_id, env):
+        ack(call, "Save failed"); return
     audit(call.from_user.id, "env_del", f"bot={bot_id} key={key}")
     ack(call, f"Deleted {key}")
     render_env_menu(call, bot_id)
@@ -14048,12 +14090,18 @@ def _handle_env_kv(m: types.Message, st: Dict[str, Any]) -> None:
         parsed = _split_embedded_env_value(k, v)
     if not parsed:
         bot.reply_to(m, f"{G['no']} no valid env assignments"); return
-    b["env"] = _repair_env_dict(b.get("env") or {})
-    b["env"].update(parsed)
-    save_bot(b)
-    audit(m.from_user.id, "env_set", f"bot={bot_id} keys={','.join(parsed.keys())}")
+    current = _repair_env_dict(b.get("env") or {})
+    current.update(parsed)
+    # Persist directly to the mutable DB and verify the write. This fixes the
+    # previous false-positive "keys saved" response where the next Env Vars
+    # screen could still show 0 variables. There is intentionally no plaintext
+    # secret in the audit record or confirmation message.
+    if not _persist_bot_env(bot_id, current):
+        bot.reply_to(m, f"{G['no']} Could not persist ENV variables. Please try again.")
+        return
+    audit(m.from_user.id, "env_set", f"bot={bot_id} keys={','.join(sorted(parsed.keys()))}")
     USER_STATES.pop(m.from_user.id, None)
-    bot.reply_to(m, f"{G['ok']} <code>{esc(', '.join(sorted(parsed.keys())))}</code> saved.", parse_mode="HTML")
+    bot.reply_to(m, f"{G['ok']} <code>{esc(', '.join(sorted(parsed.keys())))}</code> saved.\nVariables: <b>{len(current)}</b>", parse_mode="HTML")
 
 
 def _handle_pip_install(m: types.Message, st: Dict[str, Any]) -> None:
@@ -14790,8 +14838,11 @@ def _route_callback(call: types.CallbackQuery, data: str) -> None:
                 pass
     if data.startswith("env_add_"):         ack(call); start_env_add(call, data.split("_", 2)[2]); return
     if data.startswith("env_del_"):
-        parts = data.split("_", 3)
-        if len(parts) >= 4: ack(call); action_env_delete(call, parts[2], parts[3]); return
+        parts = data.split("_")
+        if len(parts) >= 5:
+            ack(call); action_env_delete(call, parts[2], parts[3], parts[4]); return
+        if len(parts) >= 4:
+            ack(call); action_env_delete(call, parts[2], parts[3]); return
     if data.startswith("bot_cron_"):        ack(call); render_cron(call, data.split("_", 2)[2]); return
     if data.startswith("bot_clone_"):       ack(call); action_bot_clone(call, data.split("_", 2)[2]); return
     if data.startswith("bot_dl_"):          ack(call); action_bot_download(call, data.split("_", 2)[2]); return
