@@ -2989,7 +2989,9 @@ def _drain_proc(bot_id: str, proc: subprocess.Popen, log: List[str]) -> None:
             return
         owner = db_load()["users"].get(str(b_doc["owner"]))
         plan = (owner or {}).get("plan", "free")
-        if PLAN_LIMITS.get(plan, {}).get("auto_restart") and not was_manual:
+        plan_active = user_plan_active(owner or {})
+        memory_limited = bool(info.get("memory_limit_exceeded", False))
+        if PLAN_LIMITS.get(plan, {}).get("auto_restart") and plan_active and not was_manual and not memory_limited:
             now = time.time()
             history = [float(x) for x in (b_doc.get("_restart_history") or []) if now - float(x) < 600]
             if len(history) >= 5:
@@ -3009,8 +3011,52 @@ def _drain_proc(bot_id: str, proc: subprocess.Popen, log: List[str]) -> None:
         pass
 
 
+def _watch_child_memory(bot_id: str, pid: int, ram_mb: int) -> None:
+    """Enforce the purchased plan's per-bot RAM allowance when psutil exists."""
+    if psutil is None or ram_mb <= 0:
+        return
+    limit = int(ram_mb) * 1024 * 1024
+    over = 0
+    while True:
+        time.sleep(2.0)
+        with _runner_lock:
+            info = RUNNING.get(bot_id)
+        if not info or info.get("proc").poll() is not None or int(info.get("proc").pid) != int(pid):
+            return
+        try:
+            rss = int(psutil.Process(pid).memory_info().rss)
+        except Exception:
+            return
+        if rss > limit:
+            over += 1
+        else:
+            over = 0
+        # Require several consecutive samples so short-lived spikes do not
+        # kill an otherwise healthy bot.
+        if over >= 3:
+            info["memory_limit_exceeded"] = True
+            try:
+                log = info.get("log")
+                if isinstance(log, list):
+                    log.append(f"[{G['warn']}] RAM limit exceeded: {rss // (1024*1024)} MB > {ram_mb} MB; bot stopped")
+            except Exception:
+                pass
+            try:
+                bd = find_bot(bot_id)
+                if bd:
+                    bd["status"] = "crashed"
+                    bd["last_error"] = f"RAM limit exceeded ({rss // (1024*1024)} MB > {ram_mb} MB). Upgrade the plan for more RAM."
+                    save_bot(bd)
+            except Exception:
+                pass
+            stop_child(bot_id, manual=False)
+            return
+
 def start_child(b: Dict[str, Any]) -> Dict[str, Any]:
     bid = b["_id"]
+    owner_doc = db_load().get("users", {}).get(str(b.get("owner")), {})
+    if not user_plan_active(owner_doc):
+        return {"ok": False, "error": "Your hosting plan is expired. Upgrade to start this bot."}
     # Approval gate — never start a bot still waiting for admin review.
     if (b or {}).get("approval_status") == "pending":
         return {"ok": False, "error": "Bot is waiting for admin approval."}
@@ -3091,6 +3137,17 @@ def start_child(b: Dict[str, Any]) -> Dict[str, Any]:
     with _runner_lock:
         RUNNING[bid] = info
     threading.Thread(target=_drain_proc, args=(bid, proc, log), daemon=True).start()
+
+    # Enforce the RAM allowance attached to the owner's active plan.
+    try:
+        plan_key = str(owner_doc.get("plan", "free") or "free")
+        ram_mb = int(PLAN_LIMITS.get(plan_key, PLAN_LIMITS["free"]).get("ram", 0) or 0)
+        if psutil is not None and ram_mb > 0:
+            threading.Thread(
+                target=_watch_child_memory, args=(bid, proc.pid, ram_mb), daemon=True,
+            ).start()
+    except Exception:
+        pass
 
     # Keep uploaded source/resource files intact while the bot is running.
     # Some legitimate bots import local modules lazily or read config/assets
@@ -4148,6 +4205,7 @@ def get_or_create_user(u: types.User, ref: Optional[int] = None) -> Tuple[Dict[s
             "joined": ts_iso(), "last_seen": ts_iso(),
             "banned": False, "ban_reason": "",
             "wallet": 0, "kyc": False,
+            "purchases": [],
             "verified": False, "verified_at": None,
             "ref_by": ref if ref and ref != u.id else None,
             "ref_count": 0, "ref_credit": 0, "trial_used": False,
@@ -4234,7 +4292,11 @@ def delete_bot_doc(bot_id: str) -> None:
 
 
 def user_max_bots(u: Dict[str, Any]) -> int:
-    plan = u.get("plan", "free")
+    # Expired subscriptions immediately fall back to Free limits. Lifetime
+    # remains active because user_plan_active() treats it as non-expiring.
+    plan = str(u.get("plan", "free") or "free")
+    if not user_plan_active(u):
+        plan = "free"
     default = PLAN_LIMITS.get(plan, PLAN_LIMITS["free"])["max_bots"]
     # Honor admin override from Settings → Plans Editor.
     base = int(get_setting(f"plan_max_bots_{plan}", default))
@@ -4242,7 +4304,14 @@ def user_max_bots(u: Dict[str, Any]) -> int:
 
 
 def user_plan_active(u: Dict[str, Any]) -> bool:
-    if u.get("plan") == "free":
+    """Return whether the user's current plan is usable.
+
+    Lifetime plans intentionally have no expiry timestamp, so a missing
+    ``plan_expires`` value is valid for lifetime and must not be treated as
+    expired.
+    """
+    plan = str(u.get("plan", "free") or "free").lower()
+    if plan in {"free", "lifetime"}:
         return True
     exp = u.get("plan_expires")
     if not exp:
@@ -4307,6 +4376,38 @@ def expiry_reminders() -> None:
                     pass
 
 
+def _record_purchased_plan(uid: int, plan: str, payment: Optional[Dict[str, Any]] = None) -> None:
+    """Persist a successful plan purchase on the user's account.
+
+    This is purchase history, separate from the currently active plan.  It is
+    deliberately keyed by payment id so retries/callbacks cannot duplicate a
+    purchase.
+    """
+    if plan not in PLAN_LIMITS:
+        return
+    d = db_load()
+    u = d.get("users", {}).get(str(uid))
+    if not u:
+        return
+    purchases = u.setdefault("purchases", [])
+    payment_id = str((payment or {}).get("id") or "")
+    if payment_id and any(str(x.get("payment_id")) == payment_id for x in purchases):
+        return
+    purchases.append({
+        "payment_id": payment_id or None,
+        "plan": plan,
+        "plan_name": PLAN_LIMITS[plan].get("name", plan),
+        "amount": float((payment or {}).get("amount", PLAN_LIMITS[plan].get("price", 0)) or 0),
+        "method": (payment or {}).get("method"),
+        "purchased_at": ts_iso(),
+        "status": "completed",
+    })
+    # Keep history bounded while retaining enough history for the account.
+    if len(purchases) > 100:
+        u["purchases"] = purchases[-100:]
+    db_save(d)
+
+
 def grant_plan(uid: int, plan: str, days: Optional[int] = None) -> bool:
     d = db_load()
     key = str(uid)
@@ -4318,16 +4419,23 @@ def grant_plan(uid: int, plan: str, days: Optional[int] = None) -> bool:
     if plan == "free":
         u["plan"] = "free"
         u["plan_expires"] = None
-    else:
+    elif plan == "lifetime":
         u["plan"] = plan
-        # extend if same plan; else set fresh
+        u["plan_expires"] = None
+        u["last_expiry_warn"] = -1
+    else:
+        old_plan = u.get("plan", "free")
+        expires = u.get("plan_expires")
         try:
-            cur_exp = datetime.fromisoformat(str(u.get("plan_expires") or "").replace("Z", "+00:00"))
+            cur_exp = datetime.fromisoformat(str(expires or "").replace("Z", "+00:00"))
         except Exception:
             cur_exp = now_utc()
-        if cur_exp < now_utc() or u.get("plan") != plan:
+        # A different/expired plan starts a fresh subscription; the same
+        # active plan is extended from its existing expiry.
+        if old_plan != plan or cur_exp <= now_utc():
             cur_exp = now_utc()
-        u["plan_expires"] = (cur_exp + timedelta(days=days)).isoformat()
+        u["plan"] = plan
+        u["plan_expires"] = (cur_exp + timedelta(days=int(days))).isoformat()
         u["last_expiry_warn"] = -1
     db_save(d)
     try:
@@ -4439,12 +4547,16 @@ def loading(call: types.CallbackQuery, label: str = "Loading") -> None:
         except Exception:
             return True
 
-    # Initial frame: visible feedback within ~1 telegram round-trip.
-    _render(15)
-
+    # Register the stop event BEFORE the first render so a very fast handler
+    # can never finish between the initial edit and event registration.
     stop_evt = threading.Event()
     with _LOADING_LOCK:
         _LOADING_STOPS[(chat_id, msg_id)] = stop_evt
+
+    # Initial frame: visible feedback within ~1 telegram round-trip.
+    if not _render(15):
+        _cancel_loading(chat_id, msg_id)
+        return
 
     def _animate() -> None:
         # Advance from 15% → ~92% over a few seconds. We never reach
@@ -10441,6 +10553,14 @@ def _payment_approve(req_id, admin_uid, note=""):
     u.setdefault("transactions", []).append({
         "type": "upgrade", "ts": ts_iso(), "plan": plan,
         "amount": req["amount"], "req_id": req_id, "note": note})
+    u.setdefault("purchases", []).append({
+        "payment_id": req_id, "plan": plan,
+        "plan_name": PLAN_LIMITS.get(plan, {}).get("name", plan),
+        "amount": float(req.get("amount", 0) or 0),
+        "method": req.get("method"), "purchased_at": ts_iso(), "status": "completed"
+    })
+    if len(u["purchases"]) > 100:
+        u["purchases"] = u["purchases"][-100:]
     db_save(d)
     audit(admin_uid, "payment_approved", f"req={req_id} uid={uid} plan={plan}")
     _wh_fire("payment_approved", {"req_id": req_id, "uid": uid, "plan": plan})
@@ -11945,6 +12065,7 @@ def render_profile(call: types.CallbackQuery) -> None:
         f"{bullet('Plan', p['name'])}\n"
         f"{bullet('Until', fmt_ts(u.get('plan_expires')) if u.get('plan_expires') else 'Forever' if p['price'] == 0 else '—')}\n"
         f"{bullet('Wallet', money(u.get('wallet', 0)))}\n"
+        f"{bullet('Purchased', str(len(u.get('purchases', []))))}\n"
         f"{bullet('Bots', str(len(bots)) + ' / ' + str(user_max_bots(u)))}\n"
         f"{bullet('Joined', fmt_ts(u.get('joined')))}\n"
         f"{bullet('Referrals', u.get('ref_count', 0))}\n"
@@ -13043,24 +13164,121 @@ def render_adm_confirm_custom(call: types.CallbackQuery, action: str,
 
 # ─── Payment handlers ─────────────────────────────────────────────────────────
 
+def _activate_plan_payment(d: Dict[str, Any], pay: Dict[str, Any], actor_id: int = 0) -> Tuple[bool, str]:
+    """Atomically activate a paid plan and record its purchase.
+
+    The payment id is the idempotency key: a retry/callback for an already
+    completed payment never grants the plan twice.  This function also makes
+    lifetime plans truly non-expiring.
+    """
+    uid = int(pay.get("uid") or 0)
+    plan = str(pay.get("plan") or "")
+    payment_id = str(pay.get("id") or "")
+    if not uid or plan not in PLAN_LIMITS or not payment_id:
+        return False, "Invalid payment/plan."
+    if str(pay.get("status")) == "approved":
+        return True, "Already approved."
+
+    u = d.setdefault("users", {}).get(str(uid))
+    if not u:
+        return False, "User account not found."
+
+    now = now_utc()
+    pl = PLAN_LIMITS[plan]
+    if plan == "lifetime":
+        u["plan"] = "lifetime"
+        u["plan_expires"] = None
+        u["last_expiry_warn"] = -1
+    else:
+        days = int(pl.get("days", 30) or 30)
+        old_plan = str(u.get("plan", "free") or "free")
+        expires = u.get("plan_expires")
+        try:
+            cur_exp = datetime.fromisoformat(str(expires or "").replace("Z", "+00:00"))
+        except Exception:
+            cur_exp = now
+        if cur_exp.tzinfo is None:
+            cur_exp = cur_exp.replace(tzinfo=timezone.utc)
+        if old_plan != plan or cur_exp <= now:
+            cur_exp = now
+        u["plan"] = plan
+        u["plan_expires"] = (cur_exp + timedelta(days=days)).isoformat()
+        u["last_expiry_warn"] = -1
+
+    # Permanent purchase history, keyed by payment id.
+    purchases = u.setdefault("purchases", [])
+    if not any(str(x.get("payment_id")) == payment_id for x in purchases):
+        purchases.append({
+            "payment_id": payment_id,
+            "plan": plan,
+            "plan_name": pl.get("name", plan),
+            "amount": float(pay.get("amount", 0) or 0),
+            "method": pay.get("method"),
+            "purchased_at": ts_iso(),
+            "approved_at": ts_iso(),
+            "approved_by": int(actor_id or 0),
+            "status": "completed",
+        })
+        if len(purchases) > 100:
+            u["purchases"] = purchases[-100:]
+
+    pay["status"] = "approved"
+    pay["approved_by"] = int(actor_id or 0)
+    pay["approved_at"] = ts_iso()
+    pay["updated"] = ts_iso()
+    d["payments"] = d.get("payments", [])
+    db_save(d)
+    return True, "Activated."
+
+def _finish_loading(call: Optional[types.CallbackQuery], label: str = "Completed") -> None:
+    """Stop the animated loader and show its terminal 100% frame."""
+    if not call or not call.message:
+        return
+    chat_id = call.message.chat.id
+    msg_id = call.message.message_id
+    # Stop first so the animation thread cannot overwrite the 100% frame.
+    _cancel_loading(chat_id, msg_id)
+    body = (
+        f"<b>✓ {esc(label)}…</b>\n"
+        f"{G['div']}\n"
+        f"<code>{_progress_bar(100)}</code>\n"
+        f"<i>{sc('Complete')}</i>{FOOTER}"
+    )
+    try:
+        if call.message.content_type == "photo":
+            bot.edit_message_caption(body, chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
+        else:
+            bot.edit_message_text(body, chat_id=chat_id, message_id=msg_id, parse_mode="HTML", disable_web_page_preview=True)
+    except Exception:
+        pass
+
 def action_payment_approve(call: types.CallbackQuery, pid: str) -> None:
     if not admin_only_call(call, "approve_payment"):
         return
     d = db_load()
     pay = next((x for x in d["payments"] if x.get("id") == pid), None)
     if not pay:
-        ack(call, "Not found"); return
+        ack(call, "Not found")
+        return
     if pay.get("status") in ("approved", "rejected"):
-        ack(call, f"Already {pay['status']}."); return
+        ack(call, f"Already {pay['status']}.")
+        return
+
     loading(call, "Approving payment")
-    pay["status"] = "approved"
-    pay["approved_by"] = call.from_user.id
-    pay["approved_at"] = ts_iso()
-    db_save(d)
-    if pay.get("kind") == "wallet_topup":
-        u = d["users"].get(str(pay["uid"]))
-        if u:
-            u["wallet"] = int(u.get("wallet", 0)) + int(pay.get("amount", 0))
+    try:
+        if pay.get("kind") == "wallet_topup":
+            u = d["users"].get(str(pay["uid"]))
+            if not u:
+                raise RuntimeError("User account not found")
+            # 92% → 100% is the approval-complete transition. Only after the
+            # terminal 100% frame is shown do we credit the user's wallet.
+            _finish_loading(call, "Payment approved")
+            time.sleep(0.7)
+            u["wallet"] = round(float(u.get("wallet", 0)) + float(pay.get("amount", 0)), 2)
+            pay["status"] = "approved"
+            pay["approved_by"] = call.from_user.id
+            pay["approved_at"] = ts_iso()
+            pay["updated"] = ts_iso()
             db_save(d)
             try:
                 bot.send_message(pay["uid"],
@@ -13068,17 +13286,69 @@ def action_payment_approve(call: types.CallbackQuery, pid: str) -> None:
                     f"{bullet('Amount', money(pay['amount']))}", parse_mode="HTML")
             except Exception:
                 pass
-    elif pay.get("plan"):
-        grant_plan(pay["uid"], pay["plan"])
-    audit(call.from_user.id, "pay_approve", f"pid={pid}")
-    ack(call, "Approved")
-    try:
-        bot.edit_message_text(f"<b>{G['ok']} {sc('Approved')} #{pid}</b>",
-                              chat_id=call.message.chat.id,
-                              message_id=call.message.message_id, parse_mode="HTML")
-    except Exception:
-        pass
+        elif pay.get("plan"):
+            uid = int(pay.get("uid") or 0)
+            plan = str(pay.get("plan") or "")
+            if not uid or plan not in PLAN_LIMITS or not d["users"].get(str(uid)):
+                raise RuntimeError("Invalid payment/plan/user")
 
+            # First finish the visible approval progress at 100%.
+            _finish_loading(call, "Payment approved")
+            time.sleep(0.7)
+
+            # Only after 100% do we activate the plan and persist the purchase.
+            ok, msg = _activate_plan_payment(d, pay, call.from_user.id)
+            if not ok:
+                raise RuntimeError(msg)
+            u = db_load()["users"].get(str(uid), {})
+            try:
+                p = PLAN_LIMITS[plan]
+                bot.send_message(
+                    uid,
+                    f"<b>{G['ok']} {sc('Plan activated')}</b>\n"
+                    f"{bullet('Plan', p['name'])}\n"
+                    f"{bullet('Bots', user_max_bots(u))}\n"
+                    f"{bullet('RAM', str(p['ram']) + ' MB')}\n"
+                    f"{bullet('Auto-restart', 'Yes' if p['auto_restart'] else 'No')}\n"
+                    f"{bullet('Until', fmt_ts(u.get('plan_expires')) if u.get('plan_expires') else 'Lifetime')}\n"
+                    f"{sc('Purchase saved to your account history.')}",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+        else:
+            raise RuntimeError("Payment has no wallet/plan target")
+
+        audit(call.from_user.id, "pay_approve", f"pid={pid}")
+        ack(call, "Approved")
+        # Keep the 100% terminal frame visible instead of immediately replacing
+        # it with another message.
+    except Exception as exc:
+        _log_err("payment_approve", exc)
+        # If plan activation failed, the payment remains pending.
+        try:
+            d2 = db_load()
+            p2 = next((x for x in d2.get("payments", []) if x.get("id") == pid), None)
+            if p2 and p2.get("status") == "approved" and p2.get("plan"):
+                p2["status"] = "pending"
+                p2.pop("approved_by", None)
+                p2.pop("approved_at", None)
+                db_save(d2)
+        except Exception:
+            pass
+        _cancel_loading(call.message.chat.id, call.message.message_id)
+        ack(call, "Approval failed")
+        try:
+            bot.edit_message_text(
+                f"<b>{G['no']} Approval failed #{pid}</b>",
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+    finally:
+        _cancel_loading(call.message.chat.id, call.message.message_id)
 
 def action_payment_reject(call: types.CallbackQuery, pid: str) -> None:
     if not admin_only_call(call, "approve_payment"):
@@ -13108,6 +13378,10 @@ def action_payment_reject(call: types.CallbackQuery, pid: str) -> None:
                               message_id=call.message.message_id, parse_mode="HTML")
     except Exception:
         pass
+    finally:
+        # Always stop the progress animation on rejection too.
+        if call and call.message:
+            _cancel_loading(call.message.chat.id, call.message.message_id)
 
 
 # ─── Admin subroute dispatcher ────────────────────────────────────────────────
@@ -14163,35 +14437,50 @@ def _verify_bharatpe_payment(utr: str, amount: float) -> str:
 
 
 def _auto_approve_payment(pid: str, actor_id: int = 0) -> bool:
-    """Approve a payment record without requiring a Telegram callback object."""
+    """Approve and activate a payment idempotently without a callback object."""
     d = db_load()
     pay = next((x for x in d.get("payments", []) if x.get("id") == pid), None)
     if not pay or pay.get("status") != "pending":
         return False
 
-    pay["status"] = "approved"
-    pay["approved_by"] = int(actor_id or 0)
-    pay["approved_at"] = ts_iso()
-    d["payments"] = d.get("payments", [])
-    db_save(d)
-
     if pay.get("kind") == "wallet_topup":
-        u = d["users"].get(str(pay["uid"]))
-        if u:
-            u["wallet"] = int(u.get("wallet", 0)) + int(pay.get("amount", 0))
-            db_save(d)
+        u = d.get("users", {}).get(str(pay.get("uid")))
+        if not u:
+            return False
+        u["wallet"] = round(float(u.get("wallet", 0)) + float(pay.get("amount", 0)), 2)
+        pay["status"] = "approved"
+        pay["approved_by"] = int(actor_id or 0)
+        pay["approved_at"] = ts_iso()
+        pay["updated"] = ts_iso()
+        db_save(d)
     elif pay.get("plan"):
-        grant_plan(pay["uid"], pay["plan"])
+        ok, _ = _activate_plan_payment(d, pay, actor_id)
+        if not ok:
+            return False
+    else:
+        return False
 
     audit(int(actor_id or 0), "pay_auto_approve", f"pid={pid};utr={pay.get('utr','')}")
     try:
-        bot.send_message(
-            pay["uid"],
-            f"<b>{G['ok']} Payment verified automatically</b>\n"
-            f"{bullet('Plan', PLAN_LIMITS.get(pay.get('plan',''), {}).get('name', pay.get('plan','—')))}\n"
-            f"{bullet('Amount', money(pay.get('amount', 0)))}",
-            parse_mode="HTML",
-        )
+        plan = str(pay.get("plan") or "")
+        if plan in PLAN_LIMITS:
+            p = PLAN_LIMITS[plan]
+            bot.send_message(
+                pay["uid"],
+                f"<b>{G['ok']} Payment verified automatically</b>\n"
+                f"{bullet('Plan', p['name'])}\n"
+                f"{bullet('Amount', money(pay.get('amount', 0)))}\n"
+                f"{bullet('Status', 'Active')}\n"
+                f"{sc('Purchase saved to your account history.')}",
+                parse_mode="HTML",
+            )
+        else:
+            bot.send_message(
+                pay["uid"],
+                f"<b>{G['ok']} Payment verified automatically</b>\n"
+                f"{bullet('Amount', money(pay.get('amount', 0)))}",
+                parse_mode="HTML",
+            )
     except Exception:
         pass
     return True
