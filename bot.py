@@ -4249,15 +4249,56 @@ def list_user_bots(uid: int) -> List[Dict[str, Any]]:
             if b.get("owner") == uid]
 
 
+def _env_sidecar_path(bot_id: str) -> Path:
+    # ENV is kept in a dedicated encrypted sidecar so unrelated DB writes can
+    # never accidentally replace a bot's secrets with a stale bot document.
+    return DIRS["bot_data"] / f"{bot_id}.env.enc"
+
+
+def _write_env_sidecar(bot_id: str, env: Dict[str, Any]) -> None:
+    clean = _repair_env_dict(env or {})
+    payload = json.dumps(clean, ensure_ascii=False, separators=(",", ":"))
+    _atomic_write(_env_sidecar_path(bot_id), _vault_encrypt(payload))
+
+
+def _read_env_sidecar(bot_id: str) -> Dict[str, str]:
+    path = _env_sidecar_path(bot_id)
+    if not path.exists():
+        return {}
+    try:
+        raw = path.read_text(encoding="utf-8")
+        decoded = _vault_decrypt(raw)
+        data = json.loads(decoded)
+        return _repair_env_dict(data if isinstance(data, dict) else {})
+    except Exception:
+        return {}
+
+
 def find_bot(bot_id: str) -> Optional[Dict[str, Any]]:
     b = db_load_ro()["bots"].get(bot_id)
-    return copy.deepcopy(b) if b is not None else None
+    if b is None:
+        return None
+    out = copy.deepcopy(b)
+    sidecar = _read_env_sidecar(bot_id)
+    db_env = _repair_env_dict(out.get("env") or {})
+    # Sidecar is authoritative when it has a complete ENV map. This prevents
+    # a stale DB bot document from making the UI show zero variables after a
+    # successful ENV save. DB remains a compatibility/backup copy.
+    if sidecar:
+        db_env.update(sidecar)
+    out["env"] = db_env
+    out["env_keys"] = sorted(db_env.keys(), key=str.upper)
+    return out
 
 
 def save_bot(doc: Dict[str, Any]) -> Dict[str, Any]:
     d = db_load()
     d["bots"][doc["_id"]] = doc
     db_save(d)
+    try:
+        _write_env_sidecar(doc["_id"], doc.get("env") or {})
+    except Exception:
+        pass
     # Per-bot JSON backup
     try:
         bot_json = DIRS["bot_data"] / f"{doc['_id']}.json"
@@ -4287,6 +4328,7 @@ def delete_bot_doc(bot_id: str) -> None:
     # Per-bot JSON bhi delete karo
     try:
         (DIRS["bot_data"] / f"{bot_id}.json").unlink(missing_ok=True)
+        _env_sidecar_path(bot_id).unlink(missing_ok=True)
     except Exception:
         pass
 
@@ -12462,11 +12504,11 @@ def render_env_menu(call: types.CallbackQuery, bot_id: str, page: int = 0) -> No
 
     # Keep the UI within Telegram's message/button limits while allowing an
     # unlimited number of stored variables. Values are NEVER displayed.
+    # Do not call save_bot() merely while rendering the ENV screen. Rendering
+    # must be read-only; an old/stale bot document must never overwrite the
+    # dedicated ENV sidecar. find_bot() merges the authoritative sidecar.
     env = _repair_env_dict(b.get("env") or {})
-    if env != (b.get("env") or {}):
-        b["env"] = env
-        save_bot(b)
-    keys = sorted(env.keys(), key=str.upper)
+    keys = sorted(set(env.keys()) | set(b.get("env_keys") or []), key=str.upper)
     per_page = 12
     pages = max(1, (len(keys) + per_page - 1) // per_page)
     page = max(0, min(int(page or 0), pages - 1))
@@ -12530,6 +12572,7 @@ def _persist_bot_env(bot_id: str, env: Dict[str, Any]) -> bool:
         b["env"] = clean
         b["env_keys"] = sorted(clean.keys(), key=str.upper)
         db_save(d)
+        _write_env_sidecar(bot_id, clean)
     # Force a fresh read after the atomic write and compare keys only; values
     # remain secret and are never logged or sent anywhere.
     fresh = find_bot(bot_id)
