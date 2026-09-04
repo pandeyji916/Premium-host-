@@ -4292,11 +4292,38 @@ def find_bot(bot_id: str) -> Optional[Dict[str, Any]]:
 
 
 def save_bot(doc: Dict[str, Any]) -> Dict[str, Any]:
+    """Persist a bot without allowing stale runtime documents to erase ENV.
+
+    ENV is independently managed by _persist_bot_env().  Runtime status updates
+    often operate on an older copy of a bot document (especially around plan
+    activation/startup).  If that stale copy contains env={}, blindly saving it
+    would erase perfectly valid paid-user ENV variables.  Merge the current
+    authoritative ENV before saving; an explicit ENV deletion is performed
+    through _persist_bot_env(), not through save_bot().
+    """
     d = db_load()
-    d["bots"][doc["_id"]] = doc
+    bid = str(doc["_id"])
+    existing = d.get("bots", {}).get(bid) or {}
+    incoming = copy.deepcopy(doc)
+
+    existing_env = _repair_env_dict(existing.get("env") or {})
+    incoming_env = _repair_env_dict(incoming.get("env") or {})
+    sidecar_env = _read_env_sidecar(bid)
+
+    # Prefer the dedicated ENV vault.  If the caller has a real non-empty ENV
+    # map, merge it in; never let an empty/stale runtime copy clear the vault.
+    authoritative_env = dict(existing_env)
+    if sidecar_env:
+        authoritative_env.update(sidecar_env)
+    if incoming_env:
+        authoritative_env.update(incoming_env)
+    incoming["env"] = authoritative_env
+    incoming["env_keys"] = sorted(authoritative_env.keys(), key=str.upper)
+
+    d["bots"][bid] = incoming
     db_save(d)
     try:
-        _write_env_sidecar(doc["_id"], doc.get("env") or {})
+        _write_env_sidecar(bid, authoritative_env)
     except Exception:
         pass
     # Per-bot JSON backup
