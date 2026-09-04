@@ -12044,7 +12044,30 @@ def render_payment_screen(call: types.CallbackQuery, data: str) -> None:
     )
 
 def start_proof_flow(call: types.CallbackQuery) -> None:
-    USER_STATES[call.from_user.id] = {"flow": "await_payment_proof"}
+    """Start proof collection without destroying the selected plan/payment state.
+
+    The payment screen already stores method, plan and amount in USER_STATES.
+    The old implementation replaced that state with only ``flow``, causing
+    submitted proofs to be saved as plan=None/method=unknown/amount=0 and
+    making admin approval fail.
+    """
+    uid = call.from_user.id
+    state = dict(USER_STATES.get(uid) or {})
+
+    # Only the proof-flow marker changes here; preserve the selected plan,
+    # payment method, amount and payment address from render_payment_screen().
+    if state.get("flow") != "await_payment_proof":
+        state["flow"] = "await_payment_proof"
+    USER_STATES[uid] = state
+
+    if not state.get("plan") or state.get("plan") not in PLAN_LIMITS:
+        bot.send_message(
+            call.message.chat.id,
+            f"{G['no']} {sc('Payment plan was not selected. Please choose a plan and payment method again.')}",
+        )
+        USER_STATES.pop(uid, None)
+        return
+
     bot.send_message(
         call.message.chat.id,
         f"{G['plus']} {sc('Send your payment screenshot or transaction id now')}. /cancel {sc('to abort')}.",
